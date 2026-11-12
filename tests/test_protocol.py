@@ -36,6 +36,13 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(rogue.replication_command(stream), ["REPLCONF", "listening-port", "6379"])
         self.assertEqual(rogue.replication_command(stream), ["PSYNC", "?", "-1"])
 
+    def test_reverse_listener_validation(self):
+        self.assertEqual(rogue.parse_listener("127.0.0.1:8080"), ("127.0.0.1", 8080))
+        with self.assertRaises(ValueError):
+            rogue.parse_listener("127.0.0.1:0")
+        with self.assertRaises(OSError):
+            rogue.parse_listener("not-an-ip:8080")
+
 
 if __name__ == "__main__":
     unittest.main()

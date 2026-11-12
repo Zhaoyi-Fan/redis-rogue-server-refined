@@ -46,6 +46,11 @@ jobs:
           test "$(docker exec redis-lab redis-cli -p 16379 --raw CONFIG GET dir | tail -n 1)" = "$before_dir"
           test "$(docker exec redis-lab redis-cli -p 16379 --raw CONFIG GET dbfilename | tail -n 1)" = "$before_file"
           test -z "$(docker exec redis-lab redis-cli -p 16379 --raw MODULE LIST)"
+          python3 tests/reverse_lab.py
+          test "$(docker exec redis-lab redis-cli -p 16379 --raw ROLE | head -n 1)" = master
+          test "$(docker exec redis-lab redis-cli -p 16379 --raw CONFIG GET dir | tail -n 1)" = "$before_dir"
+          test "$(docker exec redis-lab redis-cli -p 16379 --raw CONFIG GET dbfilename | tail -n 1)" = "$before_file"
+          test -z "$(docker exec redis-lab redis-cli -p 16379 --raw MODULE LIST)"
       - name: Redis diagnostics on failure
         if: failure()
         run: docker logs redis-lab || true

